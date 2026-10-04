@@ -13,31 +13,54 @@ final class UsageStore: ObservableObject {
 
   @Published private(set) var snapshot: UsageSnapshot?
   @Published private(set) var refreshState: RefreshState = .idle
+  @Published private(set) var claudeSnapshot: UsageSnapshot?
+  @Published private(set) var claudeRefreshState: RefreshState = .idle
+  @Published private(set) var claudeNextRetryAt: Date?
   @Published private(set) var codexExecutableURL: URL?
   @Published private(set) var launchAtLoginEnabled = false
   @Published private(set) var launchAtLoginError: String?
 
   private static let cacheKey = "cachedUsageSnapshot"
+  private static let claudeCacheKey = "cachedClaudeUsageSnapshot"
   private static let refreshInterval: TimeInterval = 5 * 60
   private static let staleAfter: TimeInterval = 60
 
-  private let client: AppServerClient
+  private let client: any CodexUsageFetching
+  private let claudeClient: any ClaudeUsageFetching
   private let locator: CodexLocator
+  private let defaults: UserDefaults
+  private let now: () -> Date
+  private var claudeRateLimitFailures = 0
+  private var codexLoadedThisSession = false
+  private var claudeLoadedThisSession = false
   private var refreshTimer: Timer?
   private var wakeObserver: NSObjectProtocol?
 
-  init(client: AppServerClient = AppServerClient(), locator: CodexLocator = CodexLocator()) {
+  init(
+    client: any CodexUsageFetching = AppServerClient(),
+    claudeClient: any ClaudeUsageFetching = ClaudeUsageClient(),
+    locator: CodexLocator = CodexLocator(),
+    defaults: UserDefaults = .standard,
+    startAutomatically: Bool = true,
+    now: @escaping () -> Date = Date.init
+  ) {
     self.client = client
+    self.claudeClient = claudeClient
     self.locator = locator
-    self.snapshot = Self.loadCachedSnapshot()
+    self.defaults = defaults
+    self.now = now
+    self.snapshot = Self.loadCachedSnapshot(key: Self.cacheKey, defaults: defaults)
+    self.claudeSnapshot = Self.loadCachedSnapshot(key: Self.claudeCacheKey, defaults: defaults)
     self.codexExecutableURL = locator.locate()
     self.launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
 
-    scheduleRefreshTimer()
-    observeWakeFromSleep()
+    if startAutomatically {
+      scheduleRefreshTimer()
+      observeWakeFromSleep()
 
-    Task { [weak self] in
-      await self?.refresh()
+      Task { [weak self] in
+        await self?.refresh()
+      }
     }
   }
 
@@ -49,7 +72,14 @@ final class UsageStore: ObservableObject {
   }
 
   var isRefreshing: Bool {
-    refreshState == .refreshing
+    isCodexRefreshing || isClaudeRefreshing
+  }
+
+  var isCodexRefreshing: Bool { refreshState == .refreshing }
+  var isClaudeRefreshing: Bool { claudeRefreshState == .refreshing }
+
+  var canRefreshClaude: Bool {
+    !isClaudeRefreshing && (claudeNextRetryAt.map { $0 <= now() } ?? true)
   }
 
   var errorMessage: String? {
@@ -57,16 +87,54 @@ final class UsageStore: ObservableObject {
     return message
   }
 
+  var claudeErrorMessage: String? {
+    guard case .failed(let message) = claudeRefreshState else { return nil }
+    return message
+  }
+
+  var codexShowsLastKnownData: Bool {
+    snapshot != nil && (!codexLoadedThisSession || errorMessage != nil || isOld(snapshot))
+  }
+
+  var claudeShowsLastKnownData: Bool {
+    claudeSnapshot != nil
+      && (!claudeLoadedThisSession || claudeErrorMessage != nil || isOld(claudeSnapshot))
+  }
+
   var menuBarText: String {
-    guard let percent = snapshot?.weeklyRemainingPercent else {
-      return isRefreshing ? "…" : "--"
-    }
-    return "\(Int(percent.rounded()))%"
+    "\(codexMenuBarText) | \(claudeMenuBarText)"
+  }
+
+  var codexMenuBarText: String {
+    menuValue(snapshot?.weeklyRemainingPercent, refreshing: isCodexRefreshing)
+  }
+
+  var claudeMenuBarText: String {
+    menuValue(claudeSnapshot?.claudeFiveHourRemainingPercent, refreshing: isClaudeRefreshing)
+  }
+
+  var menuBarHelp: String {
+    let codexNote = codexShowsLastKnownData ? " (last known)" : ""
+    let claudeNote = claudeShowsLastKnownData ? " (last known)" : ""
+    var lines = [
+      "Codex weekly remaining: \(codexMenuBarText)\(codexNote)",
+      "Claude 5-hour remaining: \(claudeMenuBarText)\(claudeNote)",
+    ]
+    if let errorMessage { lines.append("Codex: \(errorMessage)") }
+    if let claudeErrorMessage { lines.append("Claude: \(claudeErrorMessage)") }
+    return lines.joined(separator: "\n")
   }
 
   var menuBarSymbol: String {
-    guard let percent = snapshot?.weeklyRemainingPercent else {
-      return errorMessage == nil ? "gauge.with.dots.needle.50percent" : "exclamationmark.triangle"
+    if errorMessage != nil || claudeErrorMessage != nil
+      || codexShowsLastKnownData || claudeShowsLastKnownData
+    {
+      return "exclamationmark.triangle"
+    }
+    let percentages = [snapshot?.weeklyRemainingPercent, claudeSnapshot?.claudeFiveHourRemainingPercent]
+      .compactMap { $0 }
+    guard let percent = percentages.min() else {
+      return "gauge.with.dots.needle.50percent"
     }
     switch percent {
     case 50...:
@@ -79,17 +147,19 @@ final class UsageStore: ObservableObject {
   }
 
   func refreshIfStale() async {
-    guard let fetchedAt = snapshot?.fetchedAt else {
-      await refresh()
-      return
-    }
-    if Date().timeIntervalSince(fetchedAt) >= Self.staleAfter {
-      await refresh()
-    }
+    async let codex: Void = refreshCodexIfStale()
+    async let claude: Void = refreshClaudeIfStale()
+    _ = await (codex, claude)
   }
 
-  func refresh() async {
-    guard !isRefreshing else { return }
+  func refresh(allowClaudeKeychainInteraction: Bool = false) async {
+    async let codex: Void = refreshCodex()
+    async let claude: Void = refreshClaude(allowKeychainInteraction: allowClaudeKeychainInteraction)
+    _ = await (codex, claude)
+  }
+
+  func refreshCodex() async {
+    guard !isCodexRefreshing else { return }
     refreshState = .refreshing
 
     let executable = locator.locate()
@@ -104,11 +174,58 @@ final class UsageStore: ObservableObject {
     do {
       let newSnapshot = try await client.fetchRateLimits(executableURL: executable)
       snapshot = newSnapshot
-      Self.cache(newSnapshot)
+      codexLoadedThisSession = true
+      Self.cache(newSnapshot, key: Self.cacheKey, defaults: defaults)
       refreshState = .idle
     } catch {
       refreshState = .failed(error.localizedDescription)
     }
+  }
+
+  func refreshClaude(allowKeychainInteraction: Bool = false) async {
+    guard canRefreshClaude else { return }
+    claudeRefreshState = .refreshing
+    do {
+      let newSnapshot = try await claudeClient.fetchRateLimits(
+        allowKeychainInteraction: allowKeychainInteraction
+      )
+      claudeSnapshot = newSnapshot
+      claudeLoadedThisSession = true
+      Self.cache(newSnapshot, key: Self.claudeCacheKey, defaults: defaults)
+      claudeNextRetryAt = nil
+      claudeRateLimitFailures = 0
+      claudeRefreshState = .idle
+    } catch {
+      if case .rateLimited(let retryAfter) = error as? ClaudeUsageClientError {
+        claudeRateLimitFailures += 1
+        let backoff = min(3_600, 300 * pow(2, Double(min(claudeRateLimitFailures - 1, 4))))
+        claudeNextRetryAt = now().addingTimeInterval(max(backoff, retryAfter))
+      } else {
+        claudeNextRetryAt = nil
+      }
+      claudeRefreshState = .failed(error.localizedDescription)
+    }
+  }
+
+  private func refreshCodexIfStale() async {
+    if needsRefresh(snapshot) { await refreshCodex() }
+  }
+
+  private func refreshClaudeIfStale() async {
+    if needsRefresh(claudeSnapshot) { await refreshClaude() }
+  }
+
+  private func needsRefresh(_ value: UsageSnapshot?) -> Bool {
+    value.map { now().timeIntervalSince($0.fetchedAt) >= Self.staleAfter } ?? true
+  }
+
+  private func isOld(_ value: UsageSnapshot?) -> Bool {
+    value.map { now().timeIntervalSince($0.fetchedAt) >= 2 * Self.refreshInterval } ?? false
+  }
+
+  private func menuValue(_ percent: Double?, refreshing: Bool) -> String {
+    guard let percent else { return refreshing ? "…" : "--" }
+    return "\(Int(percent.rounded()))%"
   }
 
   func chooseCodexExecutable() {
@@ -130,7 +247,7 @@ final class UsageStore: ObservableObject {
     locator.saveUserSelectedPath(url.path)
     codexExecutableURL = url
     Task { [weak self] in
-      await self?.refresh()
+      await self?.refreshCodex()
     }
   }
 
@@ -172,13 +289,13 @@ final class UsageStore: ObservableObject {
     }
   }
 
-  private static func cache(_ snapshot: UsageSnapshot) {
+  private static func cache(_ snapshot: UsageSnapshot, key: String, defaults: UserDefaults) {
     guard let data = try? JSONEncoder().encode(snapshot) else { return }
-    UserDefaults.standard.set(data, forKey: cacheKey)
+    defaults.set(data, forKey: key)
   }
 
-  private static func loadCachedSnapshot() -> UsageSnapshot? {
-    guard let data = UserDefaults.standard.data(forKey: cacheKey) else { return nil }
+  private static func loadCachedSnapshot(key: String, defaults: UserDefaults) -> UsageSnapshot? {
+    guard let data = defaults.data(forKey: key) else { return nil }
     return try? JSONDecoder().decode(UsageSnapshot.self, from: data)
   }
 }

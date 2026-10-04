@@ -16,7 +16,8 @@ struct CodexLimitMenuBarApp: App {
         Text(store.menuBarText)
           .monospacedDigit()
       }
-      .accessibilityLabel("Codex weekly limit: \(store.menuBarText) remaining")
+      .help(store.menuBarHelp)
+      .accessibilityLabel(store.menuBarHelp)
     }
     .menuBarExtraStyle(.window)
   }

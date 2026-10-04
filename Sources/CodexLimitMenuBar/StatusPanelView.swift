@@ -4,29 +4,50 @@ import SwiftUI
 struct StatusPanelView: View {
   @EnvironmentObject private var store: UsageStore
 
-  private let dashboardURL = URL(string: "https://chatgpt.com/codex/settings/usage")!
-
   var body: some View {
-    VStack(alignment: .leading, spacing: 14) {
-      header
-
-      Divider()
-
-      usageContent
-
-      if let error = store.errorMessage {
-        errorBanner(error)
+    TimelineView(.periodic(from: .now, by: 30)) { _ in
+      VStack(alignment: .leading, spacing: 14) {
+        header
+        Divider()
+        ScrollView {
+          VStack(alignment: .leading, spacing: 16) {
+            UsageProviderSection(
+              name: "Codex", snapshot: store.snapshot,
+              isRefreshing: store.isCodexRefreshing,
+              showsLastKnownData: store.codexShowsLastKnownData,
+              errorMessage: store.errorMessage,
+              dashboardURL: URL(string: "https://chatgpt.com/codex/settings/usage")!,
+              canRefresh: !store.isCodexRefreshing,
+              onRefresh: { Task { await store.refreshCodex() } },
+              chooseExecutable: store.codexExecutableURL == nil
+                ? { store.chooseCodexExecutable() } : nil
+            )
+            Divider()
+            UsageProviderSection(
+              name: "Claude", snapshot: store.claudeSnapshot,
+              isRefreshing: store.isClaudeRefreshing,
+              showsLastKnownData: store.claudeShowsLastKnownData,
+              errorMessage: store.claudeErrorMessage,
+              nextRetryAt: store.claudeNextRetryAt,
+              dashboardURL: URL(string: "https://claude.ai/settings/usage")!,
+              canRefresh: store.canRefreshClaude,
+              onRefresh: {
+                Task { await store.refreshClaude(allowKeychainInteraction: true) }
+              }
+            )
+          }
+          .padding(.trailing, 2)
+        }
+        // MenuBarExtra can propose the panel's minimum size. A maximum alone
+        // lets ScrollView collapse to zero; give the viewport a definite height.
+        .frame(height: 400)
+        Divider()
+        controls
       }
-
-      Divider()
-
-      controls
+      .padding(16)
+      .frame(width: 370)
     }
-    .padding(16)
-    .frame(width: 350)
-    .task {
-      await store.refreshIfStale()
-    }
+    .task { await store.refreshIfStale() }
   }
 
   private var header: some View {
@@ -35,204 +56,187 @@ struct StatusPanelView: View {
         .font(.system(size: 24, weight: .semibold))
         .symbolRenderingMode(.hierarchical)
         .foregroundStyle(.tint)
-
       VStack(alignment: .leading, spacing: 2) {
-        Text("Codex Limit")
-          .font(.headline)
-        Text(headerSubtitle)
-          .font(.caption)
-          .foregroundStyle(.secondary)
+        Text("Codex & Claude").font(.headline)
+        Text("Codex weekly · Claude 5h remaining")
+          .font(.caption).foregroundStyle(.secondary)
       }
-
       Spacer()
-
       Button {
-        Task { await store.refresh() }
+        Task { await store.refresh(allowClaudeKeychainInteraction: true) }
       } label: {
         if store.isRefreshing {
-          ProgressView()
-            .controlSize(.small)
+          ProgressView().controlSize(.small)
         } else {
           Image(systemName: "arrow.clockwise")
         }
       }
       .buttonStyle(.borderless)
-      .help("Refresh now")
+      .help("Refresh both accounts")
       .disabled(store.isRefreshing)
     }
   }
 
-  @ViewBuilder
-  private var usageContent: some View {
-    if let snapshot = store.snapshot, !snapshot.windows.isEmpty {
-      VStack(alignment: .leading, spacing: 13) {
-        ForEach(Array(snapshot.windows.enumerated()), id: \.element.id) { index, item in
-          if index > 0 {
-            Divider()
-          }
-          LimitWindowView(item: item)
-        }
+  private var controls: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      HStack {
+        Toggle(
+          "Launch at Login",
+          isOn: Binding(
+            get: { store.launchAtLoginEnabled },
+            set: { store.setLaunchAtLogin($0) }
+          )
+        )
+        .toggleStyle(.switch)
+        Spacer()
+        Button("Quit") { NSApplication.shared.terminate(nil) }
+          .keyboardShortcut("q")
+      }
+      .controlSize(.small)
+      if let error = store.launchAtLoginError {
+        Text(error).font(.caption2).foregroundStyle(.orange)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+  }
+}
 
+private struct UsageProviderSection: View {
+  let name: String
+  let snapshot: UsageSnapshot?
+  let isRefreshing: Bool
+  let showsLastKnownData: Bool
+  let errorMessage: String?
+  var nextRetryAt: Date? = nil
+  let dashboardURL: URL
+  let canRefresh: Bool
+  let onRefresh: () -> Void
+  var chooseExecutable: (() -> Void)? = nil
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack(alignment: .top) {
+        VStack(alignment: .leading, spacing: 3) {
+          Text(name).font(.headline)
+          Text(subtitle).font(.caption2)
+            .foregroundStyle(showsLastKnownData ? Color.orange : Color.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        Spacer()
+        Button("Usage") { NSWorkspace.shared.open(dashboardURL) }
+          .buttonStyle(.borderless).font(.caption)
+          .help("Open \(name) usage dashboard")
+        Button(action: onRefresh) {
+          if isRefreshing {
+            ProgressView().controlSize(.mini)
+          } else {
+            Image(systemName: "arrow.clockwise")
+          }
+        }
+        .buttonStyle(.borderless)
+        .help("Refresh \(name)")
+        .disabled(!canRefresh)
+      }
+
+      if let snapshot, !snapshot.windows.isEmpty {
+        ForEach(snapshot.windows) { item in
+          LimitWindowView(item: item, providerName: name)
+        }
         if let resets = snapshot.resetCreditsAvailable {
           Label(
             "\(resets) earned reset\(resets == 1 ? "" : "s") available",
             systemImage: "arrow.counterclockwise.circle"
           )
-          .font(.caption)
-          .foregroundStyle(.secondary)
+          .font(.caption).foregroundStyle(.secondary)
         }
-      }
-    } else if store.isRefreshing {
-      HStack(spacing: 10) {
-        ProgressView()
-        Text("Loading Codex usage…")
-          .foregroundStyle(.secondary)
-      }
-      .frame(maxWidth: .infinity, alignment: .center)
-      .padding(.vertical, 20)
-    } else {
-      VStack(spacing: 8) {
-        Image(systemName: "gauge.with.dots.needle.50percent")
-          .font(.system(size: 28))
-          .foregroundStyle(.secondary)
-        Text("No usage data")
-          .font(.headline)
-        Text("Refresh after signing in to Codex CLI.")
-          .font(.caption)
-          .foregroundStyle(.secondary)
-      }
-      .frame(maxWidth: .infinity)
-      .padding(.vertical, 14)
-    }
-  }
-
-  private func errorBanner(_ message: String) -> some View {
-    VStack(alignment: .leading, spacing: 8) {
-      Label(message, systemImage: "exclamationmark.triangle.fill")
-        .font(.caption)
-        .foregroundStyle(.orange)
-        .fixedSize(horizontal: false, vertical: true)
-
-      if store.codexExecutableURL == nil {
-        Button("Choose Codex CLI…") {
-          store.chooseCodexExecutable()
+      } else if isRefreshing {
+        HStack(spacing: 10) {
+          ProgressView().controlSize(.small)
+          Text("Loading \(name) usage…").font(.caption).foregroundStyle(.secondary)
         }
-        .controlSize(.small)
-      }
-    }
-    .padding(10)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-  }
-
-  private var controls: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      Toggle(
-        "Launch at Login",
-        isOn: Binding(
-          get: { store.launchAtLoginEnabled },
-          set: { store.setLaunchAtLogin($0) }
-        )
-      )
-      .toggleStyle(.switch)
-      .controlSize(.small)
-
-      if let error = store.launchAtLoginError {
-        Text(error)
-          .font(.caption2)
-          .foregroundStyle(.orange)
+        .padding(.vertical, 8)
+      } else {
+        Text("No usage data. Sign in to \(name) CLI, then refresh.")
+          .font(.caption).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
 
-      HStack {
-        Button("Usage Dashboard") {
-          NSWorkspace.shared.open(dashboardURL)
+      if let errorMessage {
+        VStack(alignment: .leading, spacing: 8) {
+          Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+            .font(.caption).foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+          if let nextRetryAt, nextRetryAt > Date() {
+            Text("Retry after \(nextRetryAt.formatted(date: .omitted, time: .shortened))")
+              .font(.caption2).foregroundStyle(.secondary)
+          }
+          if let chooseExecutable {
+            Button("Choose Codex CLI…", action: chooseExecutable).controlSize(.small)
+          }
         }
-
-        Spacer()
-
-        Button("Quit") {
-          NSApplication.shared.terminate(nil)
-        }
-        .keyboardShortcut("q")
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
       }
-      .controlSize(.small)
     }
   }
 
-  private var headerSubtitle: String {
-    guard let snapshot = store.snapshot else {
-      return store.isRefreshing ? "Refreshing…" : "Waiting for usage data"
+  private var subtitle: String {
+    guard let snapshot else {
+      return isRefreshing ? "Refreshing…" : "Waiting for usage data"
     }
-
     let relative = RelativeDateTimeFormatter()
     relative.unitsStyle = .abbreviated
-    let updated = relative.localizedString(for: snapshot.fetchedAt, relativeTo: Date())
-    if let plan = snapshot.planType, !plan.isEmpty {
-      return "\(plan.capitalized) · Updated \(updated)"
-    }
-    return "Updated \(updated)"
+    let updated = Date().timeIntervalSince(snapshot.fetchedAt) < 60
+      ? "just now" : relative.localizedString(for: snapshot.fetchedAt, relativeTo: Date())
+    let prefix = showsLastKnownData ? "Last known · Checked" : "Updated"
+    let plan = snapshot.planType.map { "\($0.capitalized) · " } ?? ""
+    return "\(plan)\(prefix) \(updated)"
   }
 }
 
 private struct LimitWindowView: View {
   let item: PresentedLimitWindow
+  let providerName: String
 
-  private var remaining: Double {
-    item.window.remainingPercent
-  }
+  private var remaining: Double { item.window.remainingPercent }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 7) {
       HStack(alignment: .firstTextBaseline) {
         VStack(alignment: .leading, spacing: 1) {
-          Text(item.title)
-            .font(.subheadline.weight(.medium))
-          if item.bucketName != "Codex" {
-            Text(item.bucketName)
-              .font(.caption2)
-              .foregroundStyle(.secondary)
+          Text(item.title).font(.subheadline.weight(.medium))
+          if item.bucketName != providerName {
+            Text(item.bucketName).font(.caption2).foregroundStyle(.secondary)
           }
         }
-
         Spacer()
-
         Text("\(Int(remaining.rounded()))% left")
           .font(.system(.title3, design: .rounded, weight: .semibold))
           .foregroundStyle(statusColor)
       }
-
-      ProgressView(value: remaining, total: 100)
-        .tint(statusColor)
-
+      ProgressView(value: remaining, total: 100).tint(statusColor)
       HStack {
         Text("\(Int(item.window.usedPercent.rounded()))% used")
         Spacer()
         if let resetDate = item.window.resetDate {
-          Text(resetText(for: resetDate))
-            .help(absoluteResetText(for: resetDate))
+          Text(resetText(for: resetDate)).help(absoluteResetText(for: resetDate))
         }
       }
-      .font(.caption2)
-      .foregroundStyle(.secondary)
+      .font(.caption2).foregroundStyle(.secondary)
     }
   }
 
   private var statusColor: Color {
     switch remaining {
-    case 50...:
-      return .green
-    case 20..<50:
-      return .orange
-    default:
-      return .red
+    case 50...: return .green
+    case 20..<50: return .orange
+    default: return .red
     }
   }
 
   private func resetText(for date: Date) -> String {
-    if date <= Date() {
-      return "Reset pending"
-    }
+    if date <= Date() { return "Reset pending" }
     let formatter = RelativeDateTimeFormatter()
     formatter.unitsStyle = .full
     return "Resets \(formatter.localizedString(for: date, relativeTo: Date()))"

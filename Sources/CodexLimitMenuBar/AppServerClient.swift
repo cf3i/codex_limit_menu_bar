@@ -45,7 +45,11 @@ private struct RPCResponse<Result: Decodable>: Decodable {
   let error: RPCErrorPayload?
 }
 
-final class AppServerClient {
+protocol CodexUsageFetching: Sendable {
+  func fetchRateLimits(executableURL: URL) async throws -> UsageSnapshot
+}
+
+final class AppServerClient: CodexUsageFetching {
   private let timeout: TimeInterval
 
   init(timeout: TimeInterval = 15) {

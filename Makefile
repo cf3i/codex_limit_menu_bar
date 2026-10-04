@@ -1,4 +1,4 @@
-.PHONY: build test app clean
+.PHONY: build test app dmg clean
 
 build:
 	swift build
@@ -8,6 +8,9 @@ test:
 
 app:
 	./scripts/build-app.sh release
+
+dmg:
+	./scripts/build-dmg.sh
 
 clean:
 	swift package clean

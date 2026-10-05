@@ -3,6 +3,9 @@ import Foundation
 enum ClaudeUsageClientError: LocalizedError, Equatable {
   case credentialsNotFound
   case credentialsExpired
+  case claudeCLINotFound
+  case renewalFailed
+  case renewalTimedOut
   case keychainAccessDenied
   case invalidCredentials
   case invalidResponse
@@ -18,7 +21,13 @@ enum ClaudeUsageClientError: LocalizedError, Equatable {
     case .credentialsNotFound:
       return "Claude Code login was not found. Open Claude Code and sign in, then refresh."
     case .credentialsExpired:
-      return "Claude Code login has expired. Open Claude Code to renew it, then refresh."
+      return "Claude's access token needs renewal. Open Claude Code, then refresh."
+    case .claudeCLINotFound:
+      return "Claude Code is needed to renew access. Install or update Claude Code, then refresh."
+    case .renewalFailed:
+      return "Automatic Claude renewal did not complete. Open or update Claude Code, then refresh. Sign in only if Claude Code asks you to."
+    case .renewalTimedOut:
+      return "Claude renewal timed out. It will retry automatically; check your connection or open Claude Code."
     case .keychainAccessDenied:
       return "Claude login access is unavailable. Click Refresh to allow access, or unlock your Keychain."
     case .invalidCredentials:
@@ -28,7 +37,7 @@ enum ClaudeUsageClientError: LocalizedError, Equatable {
     case .noRateLimits:
       return "No Claude subscription limits were returned for this account."
     case .unauthorized:
-      return "Claude login was not accepted. Open Claude Code and sign in again, then refresh."
+      return "Claude still rejected access after a recovery attempt. Open Claude Code to check your login, then refresh."
     case .rateLimited:
       return "Claude usage requests are temporarily limited. Refresh will resume automatically."
     case .httpError(let status):
@@ -59,15 +68,18 @@ private final class ClaudeSessionDelegate: NSObject, URLSessionTaskDelegate {
 
 final class ClaudeUsageClient: ClaudeUsageFetching {
   private let credentials: any ClaudeCredentialReading
+  private let renewer: any ClaudeCredentialRenewing
   private let session: URLSession
   private let now: @Sendable () -> Date
 
   init(
     credentials: any ClaudeCredentialReading = ClaudeCredentialReader(),
+    renewer: any ClaudeCredentialRenewing = ClaudeCLICredentialRenewer.shared,
     session: URLSession? = nil,
     now: @escaping @Sendable () -> Date = { Date() }
   ) {
     self.credentials = credentials
+    self.renewer = renewer
     self.now = now
     if let session {
       self.session = session
@@ -84,20 +96,66 @@ final class ClaudeUsageClient: ClaudeUsageFetching {
   }
 
   func fetchRateLimits(allowKeychainInteraction: Bool = false) async throws -> UsageSnapshot {
-    let reader = credentials
-    let login = try await Task.detached(priority: .utility) {
-      try reader.read(allowInteraction: allowKeychainInteraction)
-    }.value
-    if let expiration = login.expiresAt, expiration <= now() {
-      throw ClaudeUsageClientError.credentialsExpired
+    var login = try await readCredentials(allowInteraction: allowKeychainInteraction)
+    var attemptedRenewal = false
+    if let expiration = login.expiresAt, expiration <= now().addingTimeInterval(60) {
+      login = try await renewCredentials(allowInteraction: allowKeychainInteraction)
+      attemptedRenewal = true
     }
+    do {
+      return try await fetchUsage(login: login)
+    } catch ClaudeUsageClientError.unauthorized {
+      // Another Claude Code process may already have rotated the token.
+      let current = try await readCredentials(allowInteraction: allowKeychainInteraction)
+      if current.accessToken != login.accessToken, !isExpired(current) {
+        return try await fetchUsage(login: current)
+      }
+      guard !attemptedRenewal else { throw ClaudeUsageClientError.unauthorized }
+      let renewed = try await renewCredentials(allowInteraction: allowKeychainInteraction)
+      guard renewed.accessToken != login.accessToken else {
+        throw ClaudeUsageClientError.unauthorized
+      }
+      // At most one recovery and one usage retry per refresh.
+      return try await fetchUsage(login: renewed)
+    }
+  }
 
+  private func readCredentials(allowInteraction: Bool) async throws -> ClaudeCredentials {
+    let reader = credentials
+    return try await Task.detached(priority: .utility) {
+      try reader.read(allowInteraction: allowInteraction)
+    }.value
+  }
+
+  private func isExpired(_ login: ClaudeCredentials) -> Bool {
+    login.expiresAt.map { $0 <= now() } ?? false
+  }
+
+  private func renewCredentials(allowInteraction: Bool) async throws -> ClaudeCredentials {
+    do {
+      try await renewer.renew()
+    } catch {
+      // A concurrent official CLI may have recovered even if our helper failed.
+      if let latest = try? await readCredentials(allowInteraction: allowInteraction),
+        let expiry = latest.expiresAt, expiry > now().addingTimeInterval(60)
+      { return latest }
+      throw error
+    }
+    let latest = try await readCredentials(allowInteraction: allowInteraction)
+    guard let expiry = latest.expiresAt, expiry > now() else {
+      throw ClaudeUsageClientError.renewalFailed
+    }
+    return latest
+  }
+
+  private func fetchUsage(login: ClaudeCredentials) async throws -> UsageSnapshot {
     var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
     request.cachePolicy = .reloadIgnoringLocalCacheData
     request.setValue("Bearer \(login.accessToken)", forHTTPHeaderField: "Authorization")
     request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
     request.setValue("application/json", forHTTPHeaderField: "Accept")
-    request.setValue("CodexLimitMenuBar/0.2.0", forHTTPHeaderField: "User-Agent")
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    request.setValue("CodexLimitMenuBar/\(version)", forHTTPHeaderField: "User-Agent")
 
     let data: Data
     let response: URLResponse

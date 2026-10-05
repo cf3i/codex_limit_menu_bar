@@ -156,7 +156,9 @@ private struct UsageProviderSection: View {
         }
         .padding(.vertical, 8)
       } else {
-        Text("No usage data. Sign in to \(name) CLI, then refresh.")
+        Text(errorMessage == nil
+          ? "No usage data. Sign in to \(name) CLI, then refresh."
+          : "No usage data yet.")
           .font(.caption).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }

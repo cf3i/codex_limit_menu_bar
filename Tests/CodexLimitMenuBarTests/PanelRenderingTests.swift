@@ -54,7 +54,7 @@ final class PanelRenderingTests: XCTestCase {
       defaults.set("/usr/bin/true", forKey: CodexLocator.userDefaultsKey)
       let store = UsageStore(
         client: PreviewCodexClient(snapshot: codex),
-        claudeClient: PreviewClaudeClient(snapshot: claude, error: failed ? .credentialsExpired : nil),
+        claudeClient: PreviewClaudeClient(snapshot: claude, error: failed ? .renewalFailed : nil),
         locator: CodexLocator(userDefaults: defaults), defaults: defaults, startAutomatically: false
       )
       await store.refresh()
@@ -80,7 +80,7 @@ final class PanelRenderingTests: XCTestCase {
       }
       view.cacheDisplay(in: view.bounds, to: bitmap)
       let image = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
-      let name = failed ? "panel-claude-expired.png" : "panel-healthy.png"
+      let name = failed ? "panel-claude-renewal-failed.png" : "panel-healthy.png"
       if let directory {
         try image.write(to: URL(fileURLWithPath: directory).appendingPathComponent(name))
       }

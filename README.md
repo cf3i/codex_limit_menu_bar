@@ -12,6 +12,7 @@ Codex uses the official App Server `account/rateLimits/read` endpoint. Claude us
 - Codex weekly usage and Claude five-hour/weekly usage, plus additional windows when returned
 - Reset countdowns and exact reset-time tooltips
 - Automatic refresh every five minutes, on wake, and when stale data is opened
+- Automatic Claude access-token renewal through the installed Claude Code CLI
 - Independent refresh buttons and usage dashboards for both accounts
 - Separate caches and error states; one account's failure does not block the other
 - Last-known readings are visibly marked, with the last successful update time
@@ -24,7 +25,7 @@ Codex uses the official App Server `account/rateLimits/read` endpoint. Claude us
 - macOS 13 or newer
 - Swift 6.1 / Xcode 16 or newer to build
 - A recent Codex CLI installation signed in with ChatGPT for Codex limits
-- Claude Code signed in with a Claude subscription for Claude limits
+- A recent Claude Code signed in with a Claude subscription for Claude limits (automatic renewal requires `--safe-mode` and the streaming initialization protocol; verified with 2.1.289)
 
 Either account can be used independently; an unavailable account shows `--` in its position.
 
@@ -94,7 +95,11 @@ The project is a dependency-free Swift Package. The release script builds the ex
 4. It requests `account/rateLimits/read` and converts `usedPercent` into the percentage remaining.
 5. It closes the child process after each refresh. No background server or credential copy is retained.
 
-Claude's usage request reads the `Claude Code-credentials` entry from macOS Keychain, or Claude Code's existing `.credentials.json` fallback. `CLAUDE_CONFIG_DIR` is respected, including its separate Keychain entry. Credentials are reread on every refresh so a new Claude Code login is picked up automatically. This app does not refresh or overwrite Claude Code's login; open Claude Code when its login expires, then click Refresh.
+Claude's usage request reads the `Claude Code-credentials` entry from macOS Keychain, or Claude Code's existing `.credentials.json` fallback. `CLAUDE_CONFIG_DIR` is respected, including its separate Keychain entry. Credentials are reread on every refresh so a new Claude Code login is picked up automatically.
+
+When an access token expires or has less than a minute remaining, the app runs a background Claude Code initialization and then rereads the saved credential. The helper receives only a streaming `initialize` control request, with no user prompt or model request. It runs in an empty temporary directory with customizations, tools, MCP servers, and session persistence disabled. Claude Code manages its own renewal locks and credential storage; this app never reads refresh-token values or writes login credentials. Concurrent renewal requests share one helper, which has a 60-second timeout.
+
+If Claude rejects a usage request, the app first checks whether another Claude Code process rotated the credential. It makes at most one recovery attempt and one usage retry. Renewal failures keep the last known reading and pause retries for five minutes. An access-token expiry alone does not mean you need to log in again.
 
 Claude's second menu bar value uses the aggregate `five_hour` window. If that window is absent, it shows `--`; a weekly or model-specific limit is never substituted. Claude's weekly limit remains available in the expanded panel. Remaining percentages are `100 - utilization`, clamped to 0–100. Both accounts refresh independently every five minutes, on wake, and when the panel opens with stale data. Claude's cooldown also applies to manual refresh.
 
@@ -106,6 +111,7 @@ Claude's second menu bar value uses the aggregate `five_hour` window. If that wi
 - No authentication tokens saved in app settings, files, or logs
 - Codex account requests go through the locally installed Codex CLI
 - Claude's access token is sent only to `https://api.anthropic.com/api/oauth/usage`; redirects are rejected, and cookies and HTTP caching are disabled
+- Renewal is delegated to the installed Claude Code CLI and its own authentication endpoints; helper output is discarded and no conversation is submitted
 - Cached snapshots contain only quota values, reset times, plan names, and their fetch time
 
 ## Troubleshooting
@@ -119,7 +125,7 @@ If the app cannot find Codex CLI, click **Choose Codex CLI…** in the error pan
 
 If usage cannot be loaded, run `codex` in Terminal and use `/status` to confirm the same account is signed in.
 
-For Claude, open Claude Code and check `/usage`. An expired or rejected login requires signing in again with `claude auth login`, then refreshing this app. If Keychain access is unavailable, click Claude's Refresh button to allow the macOS access prompt. Background refreshes do not open access prompts. A rate-limit error displays the next allowed retry time and retains the last successful reading.
+For Claude, access-token renewal is automatic. If renewal fails or times out, open Claude Code and check `/usage`, then refresh this app after its retry cooldown. Sign in again only if Claude Code asks you to. If the CLI is missing or too old, install/update it. If Keychain access is unavailable, click Claude's Refresh button to allow the macOS access prompt. Background credential reads do not open access prompts. Rate-limit and renewal errors display the next allowed retry time and retain the last successful reading.
 
 ## References
 

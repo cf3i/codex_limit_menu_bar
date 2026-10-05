@@ -191,4 +191,26 @@ final class UsageStoreTests: XCTestCase {
     XCTAssertNil(usage.claudeNextRetryAt)
     XCTAssertNil(usage.claudeErrorMessage)
   }
+
+  func testRenewalFailureKeepsCacheAndCoolsDownWithoutBlockingCodex() async {
+    let codex = MockCodexClient(.success(snapshot("codex", used: 61)))
+    let claude = MockClaudeClient(.success(snapshot("claude", used: 19)))
+    let usage = store(codex: codex, claude: claude)
+    await usage.refresh()
+    await claude.setResult(.failure(ClaudeUsageClientError.renewalTimedOut))
+    await usage.refreshClaude()
+    XCTAssertEqual(usage.menuBarText, "39% | 81%")
+    XCTAssertTrue(usage.claudeShowsLastKnownData)
+    XCTAssertEqual(usage.claudeNextRetryAt, clock.addingTimeInterval(300))
+    await usage.refresh()
+    let calls = await claude.calls
+    XCTAssertEqual(calls, 2)
+    XCTAssertNil(usage.errorMessage)
+    clock = clock.addingTimeInterval(300)
+    await claude.setResult(.success(snapshot("claude", used: 30)))
+    await usage.refreshClaude()
+    XCTAssertEqual(usage.claudeMenuBarText, "70%")
+    XCTAssertNil(usage.claudeNextRetryAt)
+    XCTAssertNil(usage.claudeErrorMessage)
+  }
 }

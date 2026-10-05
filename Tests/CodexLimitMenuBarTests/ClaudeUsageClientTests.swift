@@ -140,11 +140,16 @@ final class ClaudeUsageClientTests: XCTestCase {
         ClaudeCredentials(accessToken: "fixture", expiresAt: .distantPast, planType: nil)
       }
     }
+    struct FailedRenewer: ClaudeCredentialRenewing {
+      func renew() async throws { throw ClaudeUsageClientError.renewalFailed }
+    }
     do {
-      _ = try await ClaudeUsageClient(credentials: ExpiredReader()).fetchRateLimits()
+      _ = try await ClaudeUsageClient(
+        credentials: ExpiredReader(), renewer: FailedRenewer()
+      ).fetchRateLimits()
       XCTFail("Expired credentials must not be sent")
     } catch {
-      XCTAssertEqual(error as? ClaudeUsageClientError, .credentialsExpired)
+      XCTAssertEqual(error as? ClaudeUsageClientError, .renewalFailed)
     }
   }
 

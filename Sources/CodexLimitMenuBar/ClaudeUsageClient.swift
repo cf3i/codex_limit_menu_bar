@@ -6,6 +6,8 @@ enum ClaudeUsageClientError: LocalizedError, Equatable {
   case claudeCLINotFound
   case renewalFailed
   case renewalTimedOut
+  case renewalProtocolFailed
+  case renewalStillExpired
   case keychainAccessDenied
   case invalidCredentials
   case invalidResponse
@@ -28,6 +30,10 @@ enum ClaudeUsageClientError: LocalizedError, Equatable {
       return "Automatic Claude renewal did not complete. Open or update Claude Code, then refresh. Sign in only if Claude Code asks you to."
     case .renewalTimedOut:
       return "Claude renewal timed out. It will retry automatically; check your connection or open Claude Code."
+    case .renewalProtocolFailed:
+      return "Claude Code did not complete the usage check. Update Claude Code, then refresh."
+    case .renewalStillExpired:
+      return "Claude Code completed the usage check, but its saved access is still expired. Open Claude Code and check /usage to restore your login."
     case .keychainAccessDenied:
       return "Claude login access is unavailable. Click Refresh to allow access, or unlock your Keychain."
     case .invalidCredentials:
@@ -143,7 +149,7 @@ final class ClaudeUsageClient: ClaudeUsageFetching {
     }
     let latest = try await readCredentials(allowInteraction: allowInteraction)
     guard let expiry = latest.expiresAt, expiry > now() else {
-      throw ClaudeUsageClientError.renewalFailed
+      throw ClaudeUsageClientError.renewalStillExpired
     }
     return latest
   }

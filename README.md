@@ -25,7 +25,7 @@ Codex uses the official App Server `account/rateLimits/read` endpoint. Claude us
 - macOS 13 or newer
 - Swift 6.1 / Xcode 16 or newer to build
 - A recent Codex CLI installation signed in with ChatGPT for Codex limits
-- A recent Claude Code signed in with a Claude subscription for Claude limits (automatic renewal requires `--safe-mode` and the streaming initialization protocol; verified with 2.1.289)
+- A recent Claude Code signed in with a Claude subscription for Claude limits (automatic renewal requires `--safe-mode` and the streaming `get_usage` protocol; verified with 2.1.289)
 
 Either account can be used independently; an unavailable account shows `--` in its position.
 
@@ -76,7 +76,7 @@ swift test
 Optional live checks against your signed-in accounts (credentials are not printed):
 
 ```bash
-CODEX_LIMIT_LIVE_TEST=1 CLAUDE_LIMIT_LIVE_TEST=1 swift test --filter testLive
+CODEX_LIMIT_LIVE_TEST=1 CLAUDE_LIMIT_LIVE_TEST=1 CLAUDE_RENEWAL_LIVE_TEST=1 swift test --filter testLive
 ```
 
 Render app-only layout previews with sample data (no desktop capture):
@@ -97,7 +97,7 @@ The project is a dependency-free Swift Package. The release script builds the ex
 
 Claude's usage request reads the `Claude Code-credentials` entry from macOS Keychain, or Claude Code's existing `.credentials.json` fallback. `CLAUDE_CONFIG_DIR` is respected, including its separate Keychain entry. Credentials are reread on every refresh so a new Claude Code login is picked up automatically.
 
-When an access token expires or has less than a minute remaining, the app runs a background Claude Code initialization and then rereads the saved credential. The helper receives only a streaming `initialize` control request, with no user prompt or model request. It runs in an empty temporary directory with customizations, tools, MCP servers, and session persistence disabled. Claude Code manages its own renewal locks and credential storage; this app never reads refresh-token values or writes login credentials. Concurrent renewal requests share one helper, which has a 60-second timeout.
+When an access token expires or has less than a minute remaining, the app starts Claude Code, sends streaming `initialize` and `get_usage` control requests, waits for the usage response, and then rereads the saved credential. `skip_behaviors` disables transcript scanning; no user prompt or model request is sent. Initialization or a zero exit code alone is never treated as successful renewal. It runs in an empty temporary directory with customizations, tools, MCP servers, and session persistence disabled. Claude Code manages its own renewal locks and credential storage; this app never reads refresh-token values or writes login credentials. Concurrent renewal requests share one helper, which has a 60-second timeout. Telemetry and error reporting are disabled individually; the broad `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` flag is deliberately omitted because it blocks the usage request before OAuth renewal.
 
 If Claude rejects a usage request, the app first checks whether another Claude Code process rotated the credential. It makes at most one recovery attempt and one usage retry. Renewal failures keep the last known reading and pause retries for five minutes. An access-token expiry alone does not mean you need to log in again.
 

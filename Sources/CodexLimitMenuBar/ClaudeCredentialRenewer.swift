@@ -6,7 +6,7 @@ protocol ClaudeCredentialRenewing: Sendable {
 }
 
 // Claude Code owns refresh-token rotation, locking, and credential persistence.
-// Initialize its SDK transport without ever submitting a user/model message.
+// Ask its SDK transport for usage without submitting a user/model message.
 actor ClaudeCLICredentialRenewer: ClaudeCredentialRenewing {
   static let shared = ClaudeCLICredentialRenewer()
   private var pending: Task<Void, Error>?
@@ -33,6 +33,9 @@ enum ClaudeRenewalProcess {
   ]
   static let initializeMessage =
     "{\"type\":\"control_request\",\"request_id\":\"usage-auth-renewal\",\"request\":{\"subtype\":\"initialize\"}}\n"
+
+  static let usageMessage =
+    "{\"type\":\"control_request\",\"request_id\":\"usage-auth-check\",\"request\":{\"subtype\":\"get_usage\",\"skip_behaviors\":true}}\n"
 
   static func locate(
     environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -63,7 +66,10 @@ enum ClaudeRenewalProcess {
     result["PATH"] = ([executable.deletingLastPathComponent().path,
       "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
       + (inherited["PATH"] ?? "").split(separator: ":").map(String.init)).joined(separator: ":")
-    result["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    // The broad NONESSENTIAL switch blocks /api/oauth/usage before OAuth renewal.
+    // Disable telemetry specifically, keeping authenticated usage reads available.
+    result["DISABLE_TELEMETRY"] = "1"
+    result["DISABLE_ERROR_REPORTING"] = "1"
     result["DISABLE_AUTOUPDATER"] = "1"
     return result
   }
@@ -79,37 +85,85 @@ enum ClaudeRenewalProcess {
 
     let process = Process()
     let input = Pipe()
+    let output = Pipe()
+    let exited = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in exited.signal() }
     defer {
       try? input.fileHandleForWriting.close()
+      if process.isRunning {
+        process.terminate()
+        if exited.wait(timeout: .now() + 1) == .timedOut, process.isRunning {
+          kill(process.processIdentifier, SIGKILL)
+          _ = exited.wait(timeout: .now() + 1)
+        }
+      }
       try? input.fileHandleForReading.close()
+      try? output.fileHandleForReading.close()
+      try? output.fileHandleForWriting.close()
     }
     process.executableURL = executable
     process.arguments = arguments
     process.environment = environment(executable: executable)
     process.currentDirectoryURL = directory
     process.standardInput = input
-    // CLI diagnostics may contain account details. Neither retain nor log them.
-    process.standardOutput = FileHandle.nullDevice
+    process.standardOutput = output
+    // Parse only control status from stdout; never persist raw output or errors.
     process.standardError = FileHandle.nullDevice
-    let exited = DispatchSemaphore(value: 0)
-    process.terminationHandler = { _ in exited.signal() }
     do {
-      // The single message fits in the pipe; write before launch to avoid SIGPIPE
-      // if an incompatible CLI exits immediately. EOF ends initialization.
-      try input.fileHandleForWriting.write(contentsOf: Data(initializeMessage.utf8))
-      try input.fileHandleForWriting.close()
+      // Both small messages fit in the pipe. Keep it open until get_usage replies:
+      // EOF after initialize can end the CLI before background renewal runs.
+      try input.fileHandleForWriting.write(contentsOf: Data((initializeMessage + usageMessage).utf8))
       try process.run()
+      try output.fileHandleForWriting.close()
     } catch { throw ClaudeUsageClientError.renewalFailed }
-    if exited.wait(timeout: .now() + timeout) == .timedOut {
-      if process.isRunning { process.terminate() }
-      if exited.wait(timeout: .now() + 1) == .timedOut, process.isRunning {
-        kill(process.processIdentifier, SIGKILL)
-        _ = exited.wait(timeout: .now() + 1)
+
+    let deadline = DispatchTime.now() + timeout
+    var pending = Data()
+    var bytes = [UInt8](repeating: 0, count: 16_384)
+    var gotUsage = false
+    var ended = false
+    while !gotUsage && !ended {
+      guard DispatchTime.now() < deadline else { throw ClaudeUsageClientError.renewalTimedOut }
+      var descriptor = pollfd(fd: output.fileHandleForReading.fileDescriptor,
+        events: Int16(POLLIN | POLLHUP), revents: 0)
+      let ready = poll(&descriptor, 1, 100)
+      if ready < 0 {
+        if errno == EINTR { continue }
+        throw ClaudeUsageClientError.renewalFailed
       }
+      if ready == 0 { continue }
+      let count = Darwin.read(descriptor.fd, &bytes, bytes.count)
+      if count == 0 { ended = true; break }
+      guard count > 0 else {
+        if errno == EINTR { continue }
+        throw ClaudeUsageClientError.renewalFailed
+      }
+      pending.append(contentsOf: bytes.prefix(count))
+      guard pending.count <= 1_048_576 else { throw ClaudeUsageClientError.renewalProtocolFailed }
+      while let newline = pending.firstIndex(of: 0x0A) {
+        let line = pending.prefix(upTo: newline)
+        let message = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any]
+        pending.removeSubrange(...newline)
+        guard let message, message["type"] as? String == "control_response",
+          let response = message["response"] as? [String: Any],
+          let id = response["request_id"] as? String,
+          ["usage-auth-renewal", "usage-auth-check"].contains(id)
+        else { continue }
+        guard response["subtype"] as? String == "success" else {
+          throw ClaudeUsageClientError.renewalProtocolFailed
+        }
+        if id == "usage-auth-check" { gotUsage = true }
+      }
+    }
+    try? input.fileHandleForWriting.close()
+    guard exited.wait(timeout: deadline) == .success else {
       throw ClaudeUsageClientError.renewalTimedOut
     }
     guard process.terminationReason == .exit, process.terminationStatus == 0 else {
       throw ClaudeUsageClientError.renewalFailed
     }
+    guard gotUsage else { throw ClaudeUsageClientError.renewalProtocolFailed }
+    // A successful protocol response still isn't proof of renewal. The caller
+    // rereads the credential and checks its expiry before sending any usage request.
   }
 }

@@ -201,7 +201,8 @@ final class UsageStore: ObservableObject {
         let backoff = min(3_600, 300 * pow(2, Double(min(claudeRateLimitFailures - 1, 4))))
         claudeNextRetryAt = now().addingTimeInterval(max(backoff, retryAfter))
       } else if let error = error as? ClaudeUsageClientError,
-        [.renewalFailed, .renewalTimedOut, .claudeCLINotFound, .unauthorized].contains(error)
+        [.renewalFailed, .renewalTimedOut, .renewalProtocolFailed, .renewalStillExpired,
+         .claudeCLINotFound, .unauthorized].contains(error)
       {
         claudeNextRetryAt = now().addingTimeInterval(Self.refreshInterval)
       } else {

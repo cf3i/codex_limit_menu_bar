@@ -151,7 +151,7 @@ final class ClaudeRenewalTests: XCTestCase {
         XCTFail("Expired tokens must never be sent"); return (500, "")
       })
     do { _ = try await client.fetchRateLimits(); XCTFail("Expected renewal failure") }
-    catch { XCTAssertEqual(error as? ClaudeUsageClientError, .renewalFailed) }
+    catch { XCTAssertEqual(error as? ClaudeUsageClientError, .renewalStillExpired) }
   }
 
   func testHelperFailureCanAdoptCredentialRenewedByAnotherProcess() async throws {
@@ -184,5 +184,8 @@ final class ClaudeRenewalTests: XCTestCase {
     XCTAssertNil(env["CLAUDE_CODE_OAUTH_TOKEN"])
     XCTAssertNil(env["ANTHROPIC_BASE_URL"])
     XCTAssertNil(env["CLAUDE_CODE_SIMPLE"])
+    XCTAssertNil(env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"])
+    XCTAssertEqual(env["DISABLE_TELEMETRY"], "1")
+    XCTAssertEqual(env["DISABLE_ERROR_REPORTING"], "1")
   }
 }

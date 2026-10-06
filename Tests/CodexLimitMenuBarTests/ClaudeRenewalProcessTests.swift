@@ -15,10 +15,20 @@ final class ClaudeRenewalProcessTests: XCTestCase {
     try test(directory, executable)
   }
 
-  func testHelperSendsOnlyInitializationDisablesToolsAndCleansWorkingDirectory() throws {
+  func testHelperWaitsForUsageKeepsInputOpenAndAllowsUsageTraffic() throws {
     try fixture({ dir in
       """
-      cat > '\(dir.path)/input'
+      test -z "$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" || exit 4
+      test "$DISABLE_TELEMETRY" = 1 || exit 5
+      test "$DISABLE_ERROR_REPORTING" = 1 || exit 6
+      IFS= read -r init
+      printf '%s\\n' "$init" > '\(dir.path)/input'
+      echo '{"type":"control_response","response":{"request_id":"usage-auth-renewal","subtype":"success"}}'
+      IFS= read -r usage
+      printf '%s\\n' "$usage" >> '\(dir.path)/input'
+      sleep 0.2
+      echo '{"type":"control_response","response":{"request_id":"usage-auth-check","subtype":"success","response":{"rate_limits":{}}}}'
+      cat > /dev/null
       printf '%s\\n' "$@" > '\(dir.path)/arguments'
       pwd > '\(dir.path)/cwd'
       head -c 131072 /dev/zero >&2
@@ -26,10 +36,19 @@ final class ClaudeRenewalProcessTests: XCTestCase {
     }) { dir, executable in
       try ClaudeRenewalProcess.run(executable: executable, timeout: 5)
       let input = try String(contentsOf: dir.appendingPathComponent("input"), encoding: .utf8)
-      XCTAssertEqual(input.split(separator: "\n").count, 1)
-      let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(input.utf8)) as? [String: Any])
-      XCTAssertEqual(object["type"] as? String, "control_request")
-      XCTAssertEqual((object["request"] as? [String: String])?["subtype"], "initialize")
+      let lines = input.split(separator: "\n")
+      XCTAssertEqual(lines.count, 2)
+      var subtypes: [String] = []
+      for line in lines {
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+        XCTAssertEqual(object["type"] as? String, "control_request")
+        let request = try XCTUnwrap(object["request"] as? [String: Any])
+        subtypes.append(try XCTUnwrap(request["subtype"] as? String))
+        if request["subtype"] as? String == "get_usage" {
+          XCTAssertEqual(request["skip_behaviors"] as? Bool, true)
+        }
+      }
+      XCTAssertEqual(subtypes, ["initialize", "get_usage"])
       let args = try String(contentsOf: dir.appendingPathComponent("arguments"), encoding: .utf8)
       XCTAssertEqual(args, ClaudeRenewalProcess.arguments.joined(separator: "\n") + "\n")
       XCTAssertTrue(args.contains("--safe-mode\n"))
@@ -67,6 +86,40 @@ final class ClaudeRenewalProcessTests: XCTestCase {
         XCTAssertEqual($0 as? ClaudeUsageClientError, .renewalFailed)
         XCTAssertFalse($0.localizedDescription.contains("private credential detail"))
       }
+    }
+  }
+
+  func testExitZeroAfterInitializationIsNotRenewalSuccess() throws {
+    try fixture({ _ in
+      "echo '{\"type\":\"control_response\",\"response\":{\"request_id\":\"usage-auth-renewal\",\"subtype\":\"success\"}}'\nexit 0\n"
+    }) { _, executable in
+      XCTAssertThrowsError(try ClaudeRenewalProcess.run(executable: executable, timeout: 5)) {
+        XCTAssertEqual($0 as? ClaudeUsageClientError, .renewalProtocolFailed)
+      }
+    }
+  }
+
+  func testUnsupportedUsageProtocolDoesNotExposeRawError() throws {
+    try fixture({ _ in
+      "echo '{\"type\":\"control_response\",\"response\":{\"request_id\":\"usage-auth-check\",\"subtype\":\"error\",\"error\":\"private detail\"}}'\nexit 0\n"
+    }) { _, executable in
+      XCTAssertThrowsError(try ClaudeRenewalProcess.run(executable: executable, timeout: 5)) {
+        XCTAssertEqual($0 as? ClaudeUsageClientError, .renewalProtocolFailed)
+        XCTAssertFalse($0.localizedDescription.contains("private detail"))
+      }
+    }
+  }
+
+  func testLiveRenewalProtocolWhenEnabled() async throws {
+    guard ProcessInfo.processInfo.environment["CLAUDE_RENEWAL_LIVE_TEST"] == "1" else {
+      throw XCTSkip("Set CLAUDE_RENEWAL_LIVE_TEST=1 to verify the real CLI renewal protocol.")
+    }
+    // Exercise the actual Swift runner, including its production environment,
+    // across separate CLI lifetimes. Never submit a user prompt or model request.
+    for _ in 0..<2 {
+      try await ClaudeCLICredentialRenewer.shared.renew()
+      let snapshot = try await ClaudeUsageClient().fetchRateLimits()
+      XCTAssertNotNil(snapshot.claudeFiveHourRemainingPercent)
     }
   }
 }

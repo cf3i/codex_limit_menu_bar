@@ -13,7 +13,7 @@ private struct PreviewCodexClient: CodexUsageFetching {
 private struct PreviewClaudeClient: ClaudeUsageFetching {
   let snapshot: UsageSnapshot
   let error: ClaudeUsageClientError?
-  func fetchRateLimits(allowKeychainInteraction: Bool) async throws -> UsageSnapshot {
+  func fetchRateLimits() async throws -> UsageSnapshot {
     if let error { throw error }
     return snapshot
   }
@@ -54,7 +54,7 @@ final class PanelRenderingTests: XCTestCase {
       defaults.set("/usr/bin/true", forKey: CodexLocator.userDefaultsKey)
       let store = UsageStore(
         client: PreviewCodexClient(snapshot: codex),
-        claudeClient: PreviewClaudeClient(snapshot: claude, error: failed ? .renewalFailed : nil),
+        claudeClient: PreviewClaudeClient(snapshot: claude, error: failed ? .cliFailed : nil),
         locator: CodexLocator(userDefaults: defaults), defaults: defaults, startAutomatically: false
       )
       await store.refresh()

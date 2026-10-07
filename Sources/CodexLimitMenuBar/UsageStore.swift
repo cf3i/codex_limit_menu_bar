@@ -30,7 +30,7 @@ final class UsageStore: ObservableObject {
   private let locator: CodexLocator
   private let defaults: UserDefaults
   private let now: () -> Date
-  private var claudeRateLimitFailures = 0
+  private var claudeFailures = 0
   private var codexLoadedThisSession = false
   private var claudeLoadedThisSession = false
   private var refreshTimer: Timer?
@@ -38,7 +38,7 @@ final class UsageStore: ObservableObject {
 
   init(
     client: any CodexUsageFetching = AppServerClient(),
-    claudeClient: any ClaudeUsageFetching = ClaudeUsageClient(),
+    claudeClient: any ClaudeUsageFetching = ClaudeUsageClient.shared,
     locator: CodexLocator = CodexLocator(),
     defaults: UserDefaults = .standard,
     startAutomatically: Bool = true,
@@ -152,9 +152,9 @@ final class UsageStore: ObservableObject {
     _ = await (codex, claude)
   }
 
-  func refresh(allowClaudeKeychainInteraction: Bool = false) async {
+  func refresh() async {
     async let codex: Void = refreshCodex()
-    async let claude: Void = refreshClaude(allowKeychainInteraction: allowClaudeKeychainInteraction)
+    async let claude: Void = refreshClaude()
     _ = await (codex, claude)
   }
 
@@ -182,32 +182,23 @@ final class UsageStore: ObservableObject {
     }
   }
 
-  func refreshClaude(allowKeychainInteraction: Bool = false) async {
+  func refreshClaude() async {
     guard canRefreshClaude else { return }
     claudeRefreshState = .refreshing
     do {
-      let newSnapshot = try await claudeClient.fetchRateLimits(
-        allowKeychainInteraction: allowKeychainInteraction
-      )
+      let newSnapshot = try await claudeClient.fetchRateLimits()
       claudeSnapshot = newSnapshot
       claudeLoadedThisSession = true
       Self.cache(newSnapshot, key: Self.claudeCacheKey, defaults: defaults)
       claudeNextRetryAt = nil
-      claudeRateLimitFailures = 0
+      claudeFailures = 0
       claudeRefreshState = .idle
     } catch {
-      if case .rateLimited(let retryAfter) = error as? ClaudeUsageClientError {
-        claudeRateLimitFailures += 1
-        let backoff = min(3_600, 300 * pow(2, Double(min(claudeRateLimitFailures - 1, 4))))
-        claudeNextRetryAt = now().addingTimeInterval(max(backoff, retryAfter))
-      } else if let error = error as? ClaudeUsageClientError,
-        [.renewalFailed, .renewalTimedOut, .renewalProtocolFailed, .renewalStillExpired,
-         .claudeCLINotFound, .unauthorized].contains(error)
-      {
-        claudeNextRetryAt = now().addingTimeInterval(Self.refreshInterval)
-      } else {
-        claudeNextRetryAt = nil
-      }
+      // The CLI does not expose HTTP status/Retry-After when usage is unavailable.
+      // Back off on every failure, including missing usage and login problems.
+      claudeFailures += 1
+      let backoff = min(3_600, Self.refreshInterval * pow(2, Double(min(claudeFailures - 1, 4))))
+      claudeNextRetryAt = now().addingTimeInterval(backoff)
       claudeRefreshState = .failed(error.localizedDescription)
     }
   }

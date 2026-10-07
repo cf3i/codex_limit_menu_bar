@@ -1,41 +1,17 @@
 import Darwin
 import Foundation
 
-protocol ClaudeCredentialRenewing: Sendable {
-  func renew() async throws
-}
-
-// Claude Code owns refresh-token rotation, locking, and credential persistence.
-// Ask its SDK transport for usage without submitting a user/model message.
-actor ClaudeCLICredentialRenewer: ClaudeCredentialRenewing {
-  static let shared = ClaudeCLICredentialRenewer()
-  private var pending: Task<Void, Error>?
-
-  func renew() async throws {
-    if let pending { return try await pending.value }
-    let task = Task.detached(priority: .utility) {
-      guard let executable = ClaudeRenewalProcess.locate() else {
-        throw ClaudeUsageClientError.claudeCLINotFound
-      }
-      try ClaudeRenewalProcess.run(executable: executable)
-    }
-    pending = task
-    defer { pending = nil }
-    try await task.value
-  }
-}
-
-enum ClaudeRenewalProcess {
+enum ClaudeUsageProcess {
   static let arguments = [
     "-p", "--input-format", "stream-json", "--output-format", "stream-json",
     "--verbose", "--no-session-persistence", "--safe-mode", "--setting-sources", "",
     "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--tools", "",
   ]
   static let initializeMessage =
-    "{\"type\":\"control_request\",\"request_id\":\"usage-auth-renewal\",\"request\":{\"subtype\":\"initialize\"}}\n"
+    "{\"type\":\"control_request\",\"request_id\":\"usage-initialize\",\"request\":{\"subtype\":\"initialize\"}}\n"
 
   static let usageMessage =
-    "{\"type\":\"control_request\",\"request_id\":\"usage-auth-check\",\"request\":{\"subtype\":\"get_usage\",\"skip_behaviors\":true}}\n"
+    "{\"type\":\"control_request\",\"request_id\":\"usage-read\",\"request\":{\"subtype\":\"get_usage\",\"skip_behaviors\":true}}\n"
 
   static func locate(
     environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -74,13 +50,13 @@ enum ClaudeRenewalProcess {
     return result
   }
 
-  static func run(executable: URL, timeout: TimeInterval = 60) throws {
+  static func run(executable: URL, timeout: TimeInterval = 60) throws -> UsageSnapshot {
     let directory = FileManager.default.temporaryDirectory
-      .appendingPathComponent("codex-limit-renew-\(UUID().uuidString)", isDirectory: true)
+      .appendingPathComponent("codex-limit-usage-\(UUID().uuidString)", isDirectory: true)
     do {
       try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
         attributes: [.posixPermissions: 0o700])
-    } catch { throw ClaudeUsageClientError.renewalFailed }
+    } catch { throw ClaudeUsageClientError.cliFailed }
     defer { try? FileManager.default.removeItem(at: directory) }
 
     let process = Process()
@@ -107,7 +83,7 @@ enum ClaudeRenewalProcess {
     process.currentDirectoryURL = directory
     process.standardInput = input
     process.standardOutput = output
-    // Parse only control status from stdout; never persist raw output or errors.
+    // Parse only usage control responses; never persist raw output or errors.
     process.standardError = FileHandle.nullDevice
     do {
       // Both small messages fit in the pipe. Keep it open until get_usage replies:
@@ -115,31 +91,31 @@ enum ClaudeRenewalProcess {
       try input.fileHandleForWriting.write(contentsOf: Data((initializeMessage + usageMessage).utf8))
       try process.run()
       try output.fileHandleForWriting.close()
-    } catch { throw ClaudeUsageClientError.renewalFailed }
+    } catch { throw ClaudeUsageClientError.cliFailed }
 
     let deadline = DispatchTime.now() + timeout
     var pending = Data()
     var bytes = [UInt8](repeating: 0, count: 16_384)
-    var gotUsage = false
+    var snapshot: UsageSnapshot?
     var ended = false
-    while !gotUsage && !ended {
-      guard DispatchTime.now() < deadline else { throw ClaudeUsageClientError.renewalTimedOut }
+    while !ended {
+      guard DispatchTime.now() < deadline else { throw ClaudeUsageClientError.cliTimedOut }
       var descriptor = pollfd(fd: output.fileHandleForReading.fileDescriptor,
         events: Int16(POLLIN | POLLHUP), revents: 0)
       let ready = poll(&descriptor, 1, 100)
       if ready < 0 {
         if errno == EINTR { continue }
-        throw ClaudeUsageClientError.renewalFailed
+        throw ClaudeUsageClientError.cliFailed
       }
       if ready == 0 { continue }
       let count = Darwin.read(descriptor.fd, &bytes, bytes.count)
       if count == 0 { ended = true; break }
       guard count > 0 else {
         if errno == EINTR { continue }
-        throw ClaudeUsageClientError.renewalFailed
+        throw ClaudeUsageClientError.cliFailed
       }
       pending.append(contentsOf: bytes.prefix(count))
-      guard pending.count <= 1_048_576 else { throw ClaudeUsageClientError.renewalProtocolFailed }
+      guard pending.count <= 1_048_576 else { throw ClaudeUsageClientError.cliProtocolFailed }
       while let newline = pending.firstIndex(of: 0x0A) {
         let line = pending.prefix(upTo: newline)
         let message = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any]
@@ -147,23 +123,36 @@ enum ClaudeRenewalProcess {
         guard let message, message["type"] as? String == "control_response",
           let response = message["response"] as? [String: Any],
           let id = response["request_id"] as? String,
-          ["usage-auth-renewal", "usage-auth-check"].contains(id)
+          ["usage-initialize", "usage-read"].contains(id)
         else { continue }
         guard response["subtype"] as? String == "success" else {
-          throw ClaudeUsageClientError.renewalProtocolFailed
+          throw ClaudeUsageClientError.cliProtocolFailed
         }
-        if id == "usage-auth-check" { gotUsage = true }
+        if id == "usage-read", snapshot == nil {
+          guard let payload = response["response"] as? [String: Any] else {
+            throw ClaudeUsageClientError.cliProtocolFailed
+          }
+          if payload["rate_limits_available"] as? Bool == false {
+            throw ClaudeUsageClientError.noRateLimits
+          }
+          guard let limits = payload["rate_limits"] as? [String: Any] else {
+            throw ClaudeUsageClientError.usageUnavailable
+          }
+          // Decode quota fields only. Account details and other CLI output are discarded.
+          snapshot = try ClaudeUsageClient.decodeResponse(JSONSerialization.data(withJSONObject: limits))
+          try? input.fileHandleForWriting.close()
+          // Drain remaining stdout while the child exits, avoiding a full-pipe deadlock.
+        }
       }
     }
     try? input.fileHandleForWriting.close()
     guard exited.wait(timeout: deadline) == .success else {
-      throw ClaudeUsageClientError.renewalTimedOut
+      throw ClaudeUsageClientError.cliTimedOut
     }
     guard process.terminationReason == .exit, process.terminationStatus == 0 else {
-      throw ClaudeUsageClientError.renewalFailed
+      throw ClaudeUsageClientError.cliFailed
     }
-    guard gotUsage else { throw ClaudeUsageClientError.renewalProtocolFailed }
-    // A successful protocol response still isn't proof of renewal. The caller
-    // rereads the credential and checks its expiry before sending any usage request.
+    guard let snapshot else { throw ClaudeUsageClientError.cliProtocolFailed }
+    return snapshot
   }
 }

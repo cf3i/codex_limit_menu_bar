@@ -4,12 +4,6 @@ import XCTest
 @testable import CodexLimitMenuBar
 
 final class ClaudeUsageClientTests: XCTestCase {
-  private let endpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
-
-  private func response(_ status: Int = 200, headers: [String: String] = [:]) -> HTTPURLResponse {
-    HTTPURLResponse(url: endpoint, statusCode: status, httpVersion: nil, headerFields: headers)!
-  }
-
   func testDecodesActualUsageShapeWithFractionalResetDates() throws {
     let data = Data(#"""
       {
@@ -22,13 +16,13 @@ final class ClaudeUsageClientTests: XCTestCase {
         "extra_usage": {"is_enabled": false, "utilization": null}
       }
       """#.utf8)
-    let snapshot = try ClaudeUsageClient.decodeResponse(data, response: response(), planType: "pro")
+    let snapshot = try ClaudeUsageClient.decodeResponse(data)
     XCTAssertEqual(snapshot.claudeWeeklyRemainingPercent, 81)
     XCTAssertEqual(snapshot.claudeFiveHourRemainingPercent, 94)
     XCTAssertEqual(snapshot.windows.first?.window.remainingPercent, 94)
     XCTAssertEqual(snapshot.windows.map(\.title), ["5-hour limit", "Weekly limit"])
     XCTAssertNotNil(snapshot.windows.first?.window.resetDate)
-    XCTAssertEqual(snapshot.planType, "pro")
+    XCTAssertNil(snapshot.planType)
   }
 
   func testMissingAggregateWeeklyDoesNotUseModelSpecificWeekly() throws {
@@ -39,7 +33,7 @@ final class ClaudeUsageClientTests: XCTestCase {
         "seven_day_sonnet": {"utilization": 52, "resets_at": "2026-10-06T21:00:00Z"}
       }
       """#.utf8)
-    let snapshot = try ClaudeUsageClient.decodeResponse(data, response: response())
+    let snapshot = try ClaudeUsageClient.decodeResponse(data)
     XCTAssertNil(snapshot.claudeWeeklyRemainingPercent)
     XCTAssertEqual(snapshot.claudeFiveHourRemainingPercent, 80)
     XCTAssertEqual(snapshot.windows.count, 2)
@@ -50,7 +44,7 @@ final class ClaudeUsageClientTests: XCTestCase {
   func testHandlesSingleWindowAndClampsRemaining() throws {
     for (used, expected) in [(-10, 100), (110, 0)] {
       let data = Data("{\"seven_day\":{\"utilization\":\(used),\"resets_at\":null}}".utf8)
-      let snapshot = try ClaudeUsageClient.decodeResponse(data, response: response())
+      let snapshot = try ClaudeUsageClient.decodeResponse(data)
       XCTAssertEqual(snapshot.claudeWeeklyRemainingPercent, Double(expected))
     }
   }
@@ -63,103 +57,60 @@ final class ClaudeUsageClientTests: XCTestCase {
       ("not JSON", .invalidResponse),
     ] {
       XCTAssertThrowsError(try ClaudeUsageClient.decodeResponse(
-        Data(json.utf8), response: response()
+        Data(json.utf8)
       )) { XCTAssertEqual($0 as? ClaudeUsageClientError, expected) }
     }
   }
 
-  func testAuthenticationAndServerErrorsDoNotExposeResponseBody() {
-    for (status, expected) in [(401, ClaudeUsageClientError.unauthorized),
-      (403, .unauthorized), (503, .httpError(503))]
-    {
-      XCTAssertThrowsError(try ClaudeUsageClient.decodeResponse(
-        Data("sensitive server detail".utf8), response: response(status)
-      )) {
-        XCTAssertEqual($0 as? ClaudeUsageClientError, expected)
-        XCTAssertFalse($0.localizedDescription.contains("sensitive"))
+  func testConcurrentRefreshesShareCLIAndNextRefreshStartsAgain() async throws {
+    let reader = CountingUsageReader()
+    let client = ClaudeUsageClient(reader: { try await reader.read() })
+    try await withThrowingTaskGroup(of: UsageSnapshot.self) { group in
+      for _ in 0..<8 { group.addTask { try await client.fetchRateLimits() } }
+      for try await snapshot in group {
+        XCTAssertEqual(snapshot.claudeFiveHourRemainingPercent, 80)
       }
     }
+    let firstCalls = await reader.calls
+    XCTAssertEqual(firstCalls, 1)
+    _ = try await client.fetchRateLimits()
+    let secondCalls = await reader.calls
+    XCTAssertEqual(secondCalls, 2)
   }
 
-  func testHonorsRateLimitRetryAfter() {
-    XCTAssertThrowsError(try ClaudeUsageClient.decodeResponse(
-      Data(), response: response(429, headers: ["Retry-After": "900"])
-    )) { XCTAssertEqual($0 as? ClaudeUsageClientError, .rateLimited(retryAfter: 900)) }
-    let now = Date(timeIntervalSince1970: 1_791_072_000)
-    XCTAssertEqual(ClaudeUsageClient.retryDelay("0", now: now), 300)
-    XCTAssertEqual(ClaudeUsageClient.retryDelay("invalid", now: now), 300)
-    XCTAssertEqual(ClaudeUsageClient.retryDelay("inf", now: now), 300)
-    let date = DateFormatter()
-    date.locale = Locale(identifier: "en_US_POSIX")
-    date.timeZone = TimeZone(secondsFromGMT: 0)
-    date.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-    XCTAssertEqual(
-      ClaudeUsageClient.retryDelay(date.string(from: now.addingTimeInterval(1_200)), now: now), 1_200
-    )
-  }
-
-  func testReadsOnlyAccessCredentialAndConvertsMillisecondExpiration() throws {
-    let data = Data(#"""
-      {"claudeAiOauth": {
-        "accessToken": "fixture-access-token", "refreshToken": "ignored",
-        "expiresAt": 1791072000000, "subscriptionType": "pro"
-      }}
-      """#.utf8)
-    let login = try ClaudeCredentialReader.decode(data)
-    XCTAssertEqual(login.accessToken, "fixture-access-token")
-    XCTAssertEqual(login.expiresAt, Date(timeIntervalSince1970: 1_791_072_000))
-    XCTAssertEqual(login.planType, "pro")
-  }
-
-  func testRejectsMissingOrMalformedCredentials() {
-    for json in ["{}", "bad JSON", #"{"claudeAiOauth":{"accessToken":""}}"#,
-      #"{"claudeAiOauth":{"accessToken":"bad\ntoken"}}"#]
-    {
-      XCTAssertThrowsError(try ClaudeCredentialReader.decode(Data(json.utf8))) {
-        XCTAssertEqual($0 as? ClaudeUsageClientError, .invalidCredentials)
-      }
-    }
-  }
-
-  func testCustomClaudeDirectoryUsesSeparateKeychainService() {
-    let directory = URL(fileURLWithPath: "/tmp/claude-custom")
-    XCTAssertEqual(
-      ClaudeCredentialReader.keychainService(configDirectory: directory, isCustom: false),
-      "Claude Code-credentials"
-    )
-    let custom = ClaudeCredentialReader.keychainService(configDirectory: directory, isCustom: true)
-    XCTAssertTrue(custom.hasPrefix("Claude Code-credentials-"))
-    XCTAssertNotEqual(custom, ClaudeCredentialReader.keychainService(
-      configDirectory: URL(fileURLWithPath: "/tmp/claude-other"), isCustom: true
-    ))
-  }
-
-  func testExpiredCredentialFailsBeforeMakingNetworkRequest() async {
-    struct ExpiredReader: ClaudeCredentialReading {
-      func read(allowInteraction: Bool) throws -> ClaudeCredentials {
-        ClaudeCredentials(accessToken: "fixture", expiresAt: .distantPast, planType: nil)
-      }
-    }
-    struct FailedRenewer: ClaudeCredentialRenewing {
-      func renew() async throws { throw ClaudeUsageClientError.renewalFailed }
-    }
-    do {
-      _ = try await ClaudeUsageClient(
-        credentials: ExpiredReader(), renewer: FailedRenewer()
-      ).fetchRateLimits()
-      XCTFail("Expired credentials must not be sent")
-    } catch {
-      XCTAssertEqual(error as? ClaudeUsageClientError, .renewalFailed)
-    }
+  func testFailedCLIRequestCanRetryOnNextRefresh() async throws {
+    let reader = CountingUsageReader(failFirst: true)
+    let client = ClaudeUsageClient(reader: { try await reader.read() })
+    do { _ = try await client.fetchRateLimits(); XCTFail("Expected CLI failure") }
+    catch { XCTAssertEqual(error as? ClaudeUsageClientError, .cliFailed) }
+    let snapshot = try await client.fetchRateLimits()
+    XCTAssertEqual(snapshot.claudeFiveHourRemainingPercent, 80)
+    let calls = await reader.calls
+    XCTAssertEqual(calls, 2)
   }
 
   func testLiveClaudeRateLimitsWhenEnabled() async throws {
     guard ProcessInfo.processInfo.environment["CLAUDE_LIMIT_LIVE_TEST"] == "1" else {
       throw XCTSkip("Set CLAUDE_LIMIT_LIVE_TEST=1 to query the signed-in Claude account.")
     }
-    let snapshot = try await ClaudeUsageClient().fetchRateLimits()
-    XCTAssertFalse(snapshot.windows.isEmpty)
-    XCTAssertNotNil(snapshot.claudeWeeklyRemainingPercent)
-    print("Claude weekly remaining: \(snapshot.claudeWeeklyRemainingPercent ?? -1)%")
+    let client = ClaudeUsageClient()
+    for _ in 0..<2 {
+      let snapshot = try await client.fetchRateLimits()
+      XCTAssertFalse(snapshot.windows.isEmpty)
+      XCTAssertNotNil(snapshot.claudeFiveHourRemainingPercent)
+      print("Claude 5-hour remaining: \(snapshot.claudeFiveHourRemainingPercent ?? -1)%")
+    }
+  }
+}
+
+private actor CountingUsageReader {
+  private(set) var calls = 0
+  let failFirst: Bool
+  init(failFirst: Bool = false) { self.failFirst = failFirst }
+  func read() async throws -> UsageSnapshot {
+    calls += 1
+    if failFirst && calls == 1 { throw ClaudeUsageClientError.cliFailed }
+    try await Task.sleep(nanoseconds: 100_000_000)
+    return try ClaudeUsageClient.decodeResponse(Data(#"{"five_hour":{"utilization":20}}"#.utf8))
   }
 }

@@ -15,7 +15,7 @@ private actor MockClaudeClient: ClaudeUsageFetching {
   private(set) var calls = 0
   init(_ result: Result<UsageSnapshot, Error>) { self.result = result }
   func setResult(_ result: Result<UsageSnapshot, Error>) { self.result = result }
-  func fetchRateLimits(allowKeychainInteraction: Bool) async throws -> UsageSnapshot {
+  func fetchRateLimits() async throws -> UsageSnapshot {
     calls += 1
     return try result.get()
   }
@@ -114,13 +114,14 @@ final class UsageStoreTests: XCTestCase {
 
   func testClaudeLoginFailureDoesNotBlockCodexAndRecovers() async {
     let codex = MockCodexClient(.success(snapshot("codex", used: 61)))
-    let claude = MockClaudeClient(.failure(ClaudeUsageClientError.credentialsExpired))
+    let claude = MockClaudeClient(.failure(ClaudeUsageClientError.noRateLimits))
     let usage = store(codex: codex, claude: claude)
     await usage.refresh()
     XCTAssertEqual(usage.menuBarText, "39% | --")
     XCTAssertNil(usage.errorMessage)
     XCTAssertNotNil(usage.claudeErrorMessage)
     await claude.setResult(.success(snapshot("claude", used: 19)))
+    clock = clock.addingTimeInterval(300)
     await usage.refreshClaude()
     XCTAssertEqual(usage.menuBarText, "39% | 81%")
     XCTAssertNil(usage.claudeErrorMessage)
@@ -147,7 +148,7 @@ final class UsageStoreTests: XCTestCase {
     let usage = store(codex: codex, claude: claude)
     await usage.refresh()
     await codex.setResult(.success(snapshot("codex", used: 70)))
-    await claude.setResult(.failure(ClaudeUsageClientError.networkUnavailable))
+    await claude.setResult(.failure(ClaudeUsageClientError.usageUnavailable))
     await usage.refresh()
     XCTAssertEqual(usage.menuBarText, "30% | 81%")
     XCTAssertFalse(usage.codexShowsLastKnownData)
@@ -170,19 +171,19 @@ final class UsageStoreTests: XCTestCase {
     XCTAssertEqual(usage.menuBarText, "39% | 81%")
   }
 
-  func testRateLimitCooldownBlocksManualRequestsAndBacksOff() async {
+  func testUnavailableUsageBlocksManualRequestsAndBacksOff() async {
     let codex = MockCodexClient(.success(snapshot("codex", used: 61)))
-    let claude = MockClaudeClient(.failure(ClaudeUsageClientError.rateLimited(retryAfter: 900)))
+    let claude = MockClaudeClient(.failure(ClaudeUsageClientError.usageUnavailable))
     let usage = store(codex: codex, claude: claude)
     await usage.refresh()
-    XCTAssertEqual(usage.claudeNextRetryAt, clock.addingTimeInterval(900))
+    XCTAssertEqual(usage.claudeNextRetryAt, clock.addingTimeInterval(300))
     await usage.refresh()
     await usage.refreshIfStale()
     let initialCalls = await claude.calls
     XCTAssertEqual(initialCalls, 1)
     XCTAssertEqual(usage.codexMenuBarText, "39%")
-    clock = clock.addingTimeInterval(900)
-    await claude.setResult(.failure(ClaudeUsageClientError.rateLimited(retryAfter: 300)))
+    clock = clock.addingTimeInterval(300)
+    await claude.setResult(.failure(ClaudeUsageClientError.usageUnavailable))
     await usage.refreshClaude()
     XCTAssertEqual(usage.claudeNextRetryAt, clock.addingTimeInterval(600))
     clock = clock.addingTimeInterval(600)
@@ -197,7 +198,7 @@ final class UsageStoreTests: XCTestCase {
     let claude = MockClaudeClient(.success(snapshot("claude", used: 19)))
     let usage = store(codex: codex, claude: claude)
     await usage.refresh()
-    await claude.setResult(.failure(ClaudeUsageClientError.renewalTimedOut))
+    await claude.setResult(.failure(ClaudeUsageClientError.cliTimedOut))
     await usage.refreshClaude()
     XCTAssertEqual(usage.menuBarText, "39% | 81%")
     XCTAssertTrue(usage.claudeShowsLastKnownData)

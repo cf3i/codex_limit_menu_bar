@@ -32,7 +32,7 @@ struct StatusPanelView: View {
               dashboardURL: URL(string: "https://claude.ai/settings/usage")!,
               canRefresh: store.canRefreshClaude,
               onRefresh: {
-                Task { await store.refreshClaude(allowKeychainInteraction: true) }
+                Task { await store.refreshClaude() }
               }
             )
           }
@@ -63,7 +63,7 @@ struct StatusPanelView: View {
       }
       Spacer()
       Button {
-        Task { await store.refresh(allowClaudeKeychainInteraction: true) }
+        Task { await store.refresh() }
       } label: {
         if store.isRefreshing {
           ProgressView().controlSize(.small)
